@@ -1,0 +1,4 @@
+﻿适用于 .NET Framework MSBuild 版本 17.14.18+a338add32
+
+D:\粗糙度测量上位机资料\V2上位机\Infrastructure\Hardware\TSCMCAPICS.cs(926,24): warning CS0169: 从不使用字段“TSCMCAPICS.m_impl” [D:\粗糙度测量上位机资料\V2上位机\ConfocalMeter.csproj]
+  ConfocalMeter -> D:\粗糙度测量上位机资料\V2上位机\bin\Debug\TSCMCDemo4CSDllImport.exe

@@ -1,0 +1,13 @@
+E:\TronsightProject\server\trunk\dev\TSCCF\TSCMCDemo4CSDllImport\bin\Release\TSCMCDemo4CSDllImport.exe.config
+E:\TronsightProject\server\trunk\dev\TSCCF\TSCMCDemo4CSDllImport\bin\Release\TSCMCDemo4CSDllImport.exe
+E:\TronsightProject\server\trunk\dev\TSCCF\TSCMCDemo4CSDllImport\bin\Release\TSCMCDemo4CSDllImport.pdb
+E:\TronsightProject\server\trunk\dev\TSCCF\TSCMCDemo4CSDllImport\obj\Release\TSCMCDemo4CSDllImport.csproj.AssemblyReference.cache
+E:\TronsightProject\server\trunk\dev\TSCCF\TSCMCDemo4CSDllImport\obj\Release\TSCMCDemo4CSDllImport.csproj.CoreCompileInputs.cache
+E:\TronsightProject\server\trunk\dev\TSCCF\TSCMCDemo4CSDllImport\obj\Release\TSCMCDemo4CSDllImport.exe
+E:\TronsightProject\server\trunk\dev\TSCCF\TSCMCDemo4CSDllImport\obj\Release\TSCMCDemo4CSDllImport.pdb
+D:\代办事项\05-20 增加SDK样例\Confocal-SDK-V3.2.4.1_cpp_c#\TSCMCDemo4CSDllImport\bin\Release\TSCMCDemo4CSDllImport.exe.config
+D:\代办事项\05-20 增加SDK样例\Confocal-SDK-V3.2.4.1_cpp_c#\TSCMCDemo4CSDllImport\bin\Release\TSCMCDemo4CSDllImport.exe
+D:\代办事项\05-20 增加SDK样例\Confocal-SDK-V3.2.4.1_cpp_c#\TSCMCDemo4CSDllImport\obj\Release\TSCMCDemo4CSDllImport.csproj.CoreCompileInputs.cache
+D:\代办事项\05-20 增加SDK样例\Confocal-SDK-V3.2.4.1_cpp_c#\TSCMCDemo4CSDllImport\obj\Release\TSCMCDemo4CSDllImport.exe
+D:\代办事项\05-20 增加SDK样例\Confocal-SDK-V3.2.4.1_cpp_c#\TSCMCDemo4CSDllImport\obj\Release\TSCMCDemo4CSDllImport.pdb
+D:\代办事项\05-20 增加SDK样例\Confocal-SDK-V3.2.4.1_cpp_c#\TSCMCDemo4CSDllImport\bin\Release\TSCMCDemo4CSDllImport.pdb
