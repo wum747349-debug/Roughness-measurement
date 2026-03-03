@@ -1,0 +1,22 @@
+--cpu Cortex-M3
+"..\..\output\startup_stm32f101xb.o"
+"..\..\output\main.o"
+"..\..\output\stm32f1xx_it.o"
+"..\..\output\system_stm32f1xx.o"
+"..\..\output\motor_io.o"
+"..\..\output\delay.o"
+"..\..\output\uart1.o"
+"..\..\output\sys.o"
+"..\..\output\stm32f1xx_hal.o"
+"..\..\output\stm32f1xx_hal_cortex.o"
+"..\..\output\stm32f1xx_hal_dma.o"
+"..\..\output\stm32f1xx_hal_gpio.o"
+"..\..\output\stm32f1xx_hal_gpio_ex.o"
+"..\..\output\stm32f1xx_hal_uart.o"
+"..\..\output\stm32f1xx_hal_usart.o"
+"..\..\output\stm32f1xx_hal_rcc.o"
+"..\..\output\stm32f1xx_hal_rcc_ex.o"
+--library_type=microlib --strict --scatter "..\..\Output\stm32f103.sct"
+--summary_stderr --info summarysizes --map --xref --callgraph --symbols
+--info sizes --info totals --info unused --info veneers
+--list "..\..\Output\stm32f103.map" -o ..\..\Output\stm32f103.axf
