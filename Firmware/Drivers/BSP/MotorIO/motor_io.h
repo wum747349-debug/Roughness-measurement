@@ -26,4 +26,10 @@ void MotorIO_Process(void);
  */
 void MotorIO_FeedByte(uint8_t byte);
 
+/*
+ * 强制进入安全态
+ * 将所有输出控制位清零，并刷新通信时间戳，避免异常后保持旧状态
+ */
+void MotorIO_ForceSafeState(void);
+
 #endif

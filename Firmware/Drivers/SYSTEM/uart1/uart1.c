@@ -1,5 +1,6 @@
 #include "uart1.h"
 #include "sys.h"
+#include "motor_io.h"
 
 
 /* 外部引用：应用层回调 */
@@ -75,6 +76,19 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     MotorIO_FeedByte(g_isr_rx_byte);
 
     /* 重新开启中断 */
+    HAL_UART_Receive_IT(&uart1_handle, &g_isr_rx_byte, 1);
+  }
+}
+
+/* HAL 库串口错误回调：发生噪声/帧错误/溢出时立即进入安全态并恢复接收 */
+void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart) {
+  if (huart->Instance == USART1) {
+    MotorIO_ForceSafeState();
+    __HAL_UART_CLEAR_PEFLAG(huart);
+    __HAL_UART_CLEAR_FEFLAG(huart);
+    __HAL_UART_CLEAR_NEFLAG(huart);
+    __HAL_UART_CLEAR_OREFLAG(huart);
+    HAL_UART_AbortReceive(huart);
     HAL_UART_Receive_IT(&uart1_handle, &g_isr_rx_byte, 1);
   }
 }

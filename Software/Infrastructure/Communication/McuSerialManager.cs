@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.IO.Ports;
 using System.Threading;
@@ -7,15 +7,31 @@ using ConfocalMeter.Domain.Interfaces;
 namespace ConfocalMeter
 {
     /// <summary>
-    /// MCU串口通信管理器 - 用于与STM32单片机通信，控制CM35电机控制器的输入输出
-    /// 采用单例模式，供主界面和IO控制子窗体共享
+    /// MCU串口通信管理器。
     /// </summary>
     public class McuSerialManager : IMcuDriver
     {
-        #region 单例模式
-
         private static McuSerialManager _instance;
-        private static readonly object _lock = new object();
+        private static readonly object _instanceLock = new object();
+
+        private const byte HEAD = 0xAA;
+        private const byte CMD_CTRL_QUERY = 0x01;
+        private const byte TAIL = 0x55;
+        private const int FRAME_LEN = 6;
+        private const int MAX_RX_BUFFER = 4096;
+        private const int RX_LOG_INTERVAL = 20;
+        private const int SEND_INTERVAL_MS = 50;
+
+        private SerialPort _serialPort;
+        private readonly List<byte> _buffer = new List<byte>();
+        private readonly object _stateLock = new object();
+        private readonly object _txLock = new object();
+        private DateTime _lastPacketTime = DateTime.MinValue;
+        private Thread _receiveThread;
+        private volatile bool _isRunning;
+        private byte _currentInputMap;
+        private byte _currentOutputState;
+        private int _rxFrameCounter;
 
         public static McuSerialManager Instance
         {
@@ -23,7 +39,7 @@ namespace ConfocalMeter
             {
                 if (_instance == null)
                 {
-                    lock (_lock)
+                    lock (_instanceLock)
                     {
                         if (_instance == null)
                         {
@@ -31,87 +47,29 @@ namespace ConfocalMeter
                         }
                     }
                 }
+
                 return _instance;
             }
         }
 
         private McuSerialManager() { }
 
-        #endregion
-
-        #region 协议定义
-
-        private const byte HEAD = 0xAA;
-        private const byte CMD_CTRL_QUERY = 0x01;
-        private const byte TAIL = 0x55;
-
-        #endregion
-
-        #region 私有成员
-
-        private SerialPort _serialPort;
-        private List<byte> _buffer = new List<byte>();
-        private DateTime _lastPacketTime = DateTime.MinValue;
-        private Thread _receiveThread;
-        private volatile bool _isRunning = false;
-        private byte _currentInputMap = 0; // 当前输入控制位图
-        private byte _currentOutputState = 0; // 当前输出状态
-
-        #endregion
-
-        #region 公共属性
-
-        /// <summary>
-        /// 串口是否已打开
-        /// </summary>
         public bool IsOpen => _serialPort != null && _serialPort.IsOpen;
 
-        /// <summary>
-        /// 当前端口名
-        /// </summary>
-        public string PortName => _serialPort?.PortName ?? "";
+        public string PortName => _serialPort?.PortName ?? string.Empty;
 
-        /// <summary>
-        /// 通信是否正常 (500ms内有响应)
-        /// </summary>
         public bool IsConnected => IsOpen && (DateTime.Now - _lastPacketTime).TotalMilliseconds < 500;
 
-        /// <summary>
-        /// 当前输出状态
-        /// </summary>
         public byte OutputState => _currentOutputState;
 
-        /// <summary>
-        /// 当前输入控制位图
-        /// </summary>
         public byte InputMap => _currentInputMap;
 
-        #endregion
-
-        #region 事件
-
-        /// <summary>
-        /// 日志事件
-        /// </summary>
         public event Action<string> OnLog;
 
-        /// <summary>
-        /// 输出状态更新事件
-        /// </summary>
         public event Action<byte> OnOutputStateChanged;
 
-        /// <summary>
-        /// 连接状态变化事件
-        /// </summary>
         public event Action<bool> OnConnectionChanged;
 
-        #endregion
-
-        #region 公共方法
-
-        /// <summary>
-        /// 打开串口
-        /// </summary>
         public bool Open(string portName, int baudRate = 115200)
         {
             try
@@ -121,7 +79,7 @@ namespace ConfocalMeter
                     Close();
                 }
 
-                _serialPort = new SerialPort()
+                _serialPort = new SerialPort
                 {
                     PortName = portName,
                     BaudRate = baudRate,
@@ -129,15 +87,30 @@ namespace ConfocalMeter
                     StopBits = StopBits.One,
                     Parity = Parity.None,
                     ReadTimeout = 100,
-                    WriteTimeout = 100
+                    WriteTimeout = 100,
+                    DtrEnable = true,
+                    RtsEnable = true
                 };
 
                 _serialPort.Open();
-                _buffer.Clear();
+                _serialPort.DiscardInBuffer();
+                _serialPort.DiscardOutBuffer();
+
+                lock (_buffer)
+                {
+                    _buffer.Clear();
+                }
+
+                // 重连后默认进入安全态：所有输入请求清零
+                lock (_stateLock)
+                {
+                    _currentInputMap = 0;
+                }
+                _currentOutputState = 0;
+                _rxFrameCounter = 0;
                 _lastPacketTime = DateTime.MinValue;
                 _isRunning = true;
 
-                // 启动独立的接收和发送线程
                 _receiveThread = new Thread(CommunicationLoop)
                 {
                     IsBackground = true,
@@ -145,6 +118,8 @@ namespace ConfocalMeter
                 };
                 _receiveThread.Start();
 
+                // 打开后立即发送一帧，避免首次IO切换等待周期发送
+                SendFrame();
                 Log($"串口已打开: {portName}");
                 OnConnectionChanged?.Invoke(true);
                 return true;
@@ -156,14 +131,22 @@ namespace ConfocalMeter
             }
         }
 
-        /// <summary>
-        /// 关闭串口
-        /// </summary>
         public void Close()
         {
+            // 关闭前主动下发一次安全态（InputMap=0），形成上下位机双保险
+            if (_serialPort != null && _serialPort.IsOpen)
+            {
+                lock (_stateLock)
+                {
+                    _currentInputMap = 0;
+                }
+                SendFrame();
+                Thread.Sleep(20);
+                SendFrame();
+            }
+
             _isRunning = false;
 
-            // 等待线程结束
             if (_receiveThread != null && _receiveThread.IsAlive)
             {
                 _receiveThread.Join(500);
@@ -177,205 +160,270 @@ namespace ConfocalMeter
                     {
                         _serialPort.Close();
                     }
+
                     _serialPort.Dispose();
                 }
-                catch { }
-                _serialPort = null;
+                catch (Exception ex)
+                {
+                    Log($"关闭串口异常: {ex.Message}");
+                }
+                finally
+                {
+                    _serialPort = null;
+                }
             }
 
             _currentOutputState = 0;
+            lock (_stateLock)
+            {
+                _currentInputMap = 0;
+            }
             Log("串口已关闭");
             OnConnectionChanged?.Invoke(false);
         }
 
-        /// <summary>
-        /// 设置输入控制位图
-        /// </summary>
-        /// <param name="inputMap">8位输入控制位图</param>
         public void SetInputMap(byte inputMap)
         {
-            _currentInputMap = inputMap;
+            lock (_stateLock)
+            {
+                _currentInputMap = inputMap;
+            }
+
+            // 映射变化后立即下发，提升IO控制实时性
+            SendFrame();
         }
 
-        /// <summary>
-        /// 设置单个输入位
-        /// </summary>
-        public void SetInputBit(int index, bool value)
+        public void SetInputBit(int bitIndex, bool value)
         {
-            if (index < 0 || index > 7) return;
+            if (bitIndex < 0 || bitIndex > 7)
+            {
+                return;
+            }
 
-            if (value)
-                _currentInputMap |= (byte)(1 << index);
-            else
-                _currentInputMap &= (byte)~(1 << index);
+            bool changed = false;
+
+            lock (_stateLock)
+            {
+                byte oldMap = _currentInputMap;
+                if (value)
+                {
+                    _currentInputMap |= (byte)(1 << bitIndex);
+                }
+                else
+                {
+                    _currentInputMap &= (byte)~(1 << bitIndex);
+                }
+
+                changed = oldMap != _currentInputMap;
+            }
+
+            // 用户点击后立即下发，避免“勾选后无响应”的体感延迟
+            if (changed)
+            {
+                SendFrame();
+            }
         }
 
-        /// <summary>
-        /// 获取输出位状态
-        /// </summary>
-        public bool GetOutputBit(int index)
+        public bool GetOutputBit(int bitIndex)
         {
-            if (index < 0 || index > 7) return false;
-            return (_currentOutputState & (1 << index)) != 0;
+            if (bitIndex < 0 || bitIndex > 7)
+            {
+                return false;
+            }
+
+            return (_currentOutputState & (1 << bitIndex)) != 0;
         }
 
-        #endregion
-
-        #region 通信线程
-
-        /// <summary>
-        /// 通信循环 - 在独立线程中运行，避免阻塞UI
-        /// </summary>
         private void CommunicationLoop()
         {
-            int sendCounter = 0;
+            var loopSw = System.Diagnostics.Stopwatch.StartNew();
+            long nextSendMs = 0;
 
             while (_isRunning && _serialPort != null && _serialPort.IsOpen)
             {
                 try
                 {
-                    // 每200ms发送一次控制帧
-                    if (sendCounter >= 200)
+                    if (loopSw.ElapsedMilliseconds >= nextSendMs)
                     {
                         SendFrame();
-                        sendCounter = 0;
+                        nextSendMs = loopSw.ElapsedMilliseconds + SEND_INTERVAL_MS;
                     }
 
-                    // 接收数据
                     ReceiveData();
 
                     Thread.Sleep(10);
-                    sendCounter += 10;
                 }
                 catch (Exception ex)
                 {
-                    if (_isRunning) // 只有在运行时才记录异常
+                    if (_isRunning)
                     {
                         Log($"通信异常: {ex.Message}");
+                        OnConnectionChanged?.Invoke(false);
                     }
+
                     break;
                 }
             }
         }
 
-        /// <summary>
-        /// 发送控制帧
-        /// </summary>
         private void SendFrame()
         {
-            if (_serialPort == null || !_serialPort.IsOpen) return;
+            if (_serialPort == null || !_serialPort.IsOpen)
+            {
+                return;
+            }
 
             try
             {
-                byte[] frame = new byte[6];
+                byte inputMapSnapshot;
+                lock (_stateLock)
+                {
+                    inputMapSnapshot = _currentInputMap;
+                }
+
+                byte[] frame = new byte[FRAME_LEN];
                 frame[0] = HEAD;
                 frame[1] = CMD_CTRL_QUERY;
-                frame[2] = _currentInputMap;
+                frame[2] = inputMapSnapshot;
                 frame[3] = 0x00;
 
                 long sum = frame[0] + frame[1] + frame[2] + frame[3];
                 frame[4] = (byte)(sum & 0xFF);
                 frame[5] = TAIL;
 
-                _serialPort.Write(frame, 0, frame.Length);
+                lock (_txLock)
+                {
+                    _serialPort.Write(frame, 0, frame.Length);
+                }
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log($"发送失败: {ex.Message}");
+            }
         }
 
-        /// <summary>
-        /// 接收并处理数据
-        /// </summary>
         private void ReceiveData()
         {
-            if (_serialPort == null || !_serialPort.IsOpen) return;
+            if (_serialPort == null || !_serialPort.IsOpen)
+            {
+                return;
+            }
 
             try
             {
                 int bytesToRead = _serialPort.BytesToRead;
-                if (bytesToRead > 0)
+                if (bytesToRead <= 0)
                 {
-                    byte[] temp = new byte[bytesToRead];
-                    _serialPort.Read(temp, 0, bytesToRead);
-
-                    lock (_buffer)
-                    {
-                        _buffer.AddRange(temp);
-                    }
-
-                    ProcessBuffer();
+                    return;
                 }
+
+                byte[] temp = new byte[bytesToRead];
+                _serialPort.Read(temp, 0, bytesToRead);
+
+                lock (_buffer)
+                {
+                    _buffer.AddRange(temp);
+                    if (_buffer.Count > MAX_RX_BUFFER)
+                    {
+                        int drop = _buffer.Count - MAX_RX_BUFFER;
+                        _buffer.RemoveRange(0, drop);
+                        Log($"接收缓冲区溢出，丢弃 {drop} 字节旧数据");
+                    }
+                }
+
+                ProcessBuffer();
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log($"接收失败: {ex.Message}");
+            }
         }
 
-        /// <summary>
-        /// 处理接收缓冲区
-        /// </summary>
         private void ProcessBuffer()
         {
+            byte? changedOutput = null;
+            byte[] latestFrame = null;
+            string checksumError = null;
+
             lock (_buffer)
             {
-                while (_buffer.Count >= 6)
+                int idx = 0;
+
+                while (_buffer.Count - idx >= FRAME_LEN)
                 {
-                    if (_buffer[0] != HEAD)
+                    if (_buffer[idx] != HEAD)
                     {
-                        _buffer.RemoveAt(0);
+                        idx++;
                         continue;
                     }
 
-                    if (_buffer[5] != TAIL)
+                    if (_buffer[idx + FRAME_LEN - 1] != TAIL)
                     {
-                        _buffer.RemoveAt(0);
+                        idx++;
                         continue;
                     }
 
-                    long calcSum = _buffer[0] + _buffer[1] + _buffer[2] + _buffer[3];
+                    long calcSum = _buffer[idx] + _buffer[idx + 1] + _buffer[idx + 2] + _buffer[idx + 3];
                     byte calcChecksum = (byte)(calcSum & 0xFF);
-                    byte recvChecksum = _buffer[4];
+                    byte recvChecksum = _buffer[idx + 4];
 
                     if (calcChecksum == recvChecksum)
                     {
-                        byte cmd = _buffer[1];
-                        byte outputState = _buffer[3];
+                        byte cmd = _buffer[idx + 1];
+                        byte outputState = _buffer[idx + 3];
 
-                        if (cmd == CMD_CTRL_QUERY)
+                        if (cmd == CMD_CTRL_QUERY && _currentOutputState != outputState)
                         {
-                            if (_currentOutputState != outputState)
-                            {
-                                _currentOutputState = outputState;
-                                OnOutputStateChanged?.Invoke(outputState);
-                            }
-                            else
-                            {
-                                _currentOutputState = outputState;
-                            }
+                            _currentOutputState = outputState;
+                            changedOutput = outputState;
+                        }
+                        else
+                        {
+                            _currentOutputState = outputState;
                         }
 
-                        byte[] validFrame = new byte[6];
-                        _buffer.CopyTo(0, validFrame, 0, 6);
-                        Log($"RX: {BitConverter.ToString(validFrame)}");
-
-                        _buffer.RemoveRange(0, 6);
+                        latestFrame = new byte[FRAME_LEN];
+                        _buffer.CopyTo(idx, latestFrame, 0, FRAME_LEN);
+                        idx += FRAME_LEN;
                         _lastPacketTime = DateTime.Now;
                     }
                     else
                     {
-                        Log($"校验失败: 收到{recvChecksum:X2} 计算{calcChecksum:X2}");
-                        _buffer.RemoveAt(0);
+                        checksumError = $"校验失败: 收到{recvChecksum:X2} 计算{calcChecksum:X2}";
+                        idx++;
                     }
+                }
+
+                if (idx > 0)
+                {
+                    _buffer.RemoveRange(0, idx);
+                }
+            }
+
+            if (changedOutput.HasValue)
+            {
+                OnOutputStateChanged?.Invoke(changedOutput.Value);
+            }
+
+            if (!string.IsNullOrEmpty(checksumError))
+            {
+                Log(checksumError);
+            }
+
+            if (latestFrame != null)
+            {
+                _rxFrameCounter++;
+                if (_rxFrameCounter >= RX_LOG_INTERVAL)
+                {
+                    _rxFrameCounter = 0;
+                    Log($"RX: {BitConverter.ToString(latestFrame)}");
                 }
             }
         }
-
-        #endregion
-
-        #region 辅助方法
 
         private void Log(string msg)
         {
             OnLog?.Invoke(msg);
         }
-
-        #endregion
     }
 }

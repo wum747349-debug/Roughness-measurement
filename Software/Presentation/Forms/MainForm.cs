@@ -74,6 +74,13 @@ namespace ConfocalMeter
         private bool _isScanning = false;
         private Thread _scanThread;
         private List<double> _rawProfileData = new List<double>(); // 原始采集数据
+        private readonly object _rawDataLock = new object();
+        private int _rawPointCount = 0;
+        private const int McuInputScanReqBit = 0; // IN6
+        private const int McuOutputBusyBit = 0;   // OUT1(BUSY)
+        private const int McuOutputSyncBit = 1;   // OUT2(SYNC)
+        private const int McuOutputDoneBit = 2;   // OUT3(DONE)
+        private const int McuOutputFaultBit = 3;  // OUT4(FAULT)
 
         public MainForm()
         {
@@ -397,12 +404,26 @@ namespace ConfocalMeter
             if (!Sensor.IsConnected) { MessageBox.Show("请先连接设备！"); return; }
             if (_isScanning) return;
 
+            if (!McuSerialManager.Instance.IsOpen)
+            {
+                MessageBox.Show("请先打开 MCU 串口（用于 IN6/OUT1/OUT2 握手）！", "提示");
+                return;
+            }
+
             // 获取参数
             double lengthMm = (double)numEvalLength.Value;
             double speedMmMin = (double)numMotorSpeed.Value;
-            if (speedMmMin <= 0) return;
-            double speedMmSec = speedMmMin / 60.0;
-            double durationSec = lengthMm / speedMmSec;
+            if (lengthMm <= 0 || speedMmMin <= 0)
+            {
+                MessageBox.Show("扫描长度和速度必须大于 0。", "提示");
+                return;
+            }
+
+            if (McuSerialManager.Instance.GetOutputBit(McuOutputBusyBit))
+            {
+                MessageBox.Show("控制器当前处于 BUSY 状态，请等待回原位后再启动。", "提示");
+                return;
+            }
 
             // 下发采样
             SAMPLING_INTERVAL intervalEnum = (SAMPLING_INTERVAL)cmbRoughnessSampling.SelectedIndex;
@@ -410,111 +431,286 @@ namespace ConfocalMeter
 
             // 准备
             _isScanning = true;
-            _rawProfileData.Clear();
+            lock (_rawDataLock)
+            {
+                _rawProfileData.Clear();
+            }
+            Interlocked.Exchange(ref _rawPointCount, 0);
             chartProfile.Series["原始轮廓"].Points.Clear();
             chartProfile.Series["去趋势轮廓"].Points.Clear();
             chartProfile.Series["粗糙度"].Points.Clear();
             chartAF.Series["AF曲线"].Points.Clear();
             chartAF.Series["核心线"].Points.Clear();
 
-            // UI 更新
-            btnStartScan.Enabled = false; btnStartScan.Text = "扫描中..."; btnStartScan.BackColor = Color.LightSalmon;
-            progressBarScan.Visible = true; progressBarScan.Value = 0;
-            lblScanStatus.Text = $"扫描中... (预计 {durationSec:F1}s)";
+            btnStartScan.Enabled = false;
+            btnStartScan.Text = "扫描中...";
+            btnStartScan.BackColor = Color.LightSalmon;
+            progressBarScan.Visible = true;
+            progressBarScan.Value = 0;
+            lblScanStatus.Text = "握手中...等待 BUSY";
 
-            // 启动线程
-            _scanThread = new Thread(() => ScanTask(durationSec, speedMmMin));
+            _scanThread = new Thread(() => ScanTask(lengthMm, speedMmMin));
             _scanThread.IsBackground = true;
             _scanThread.Start();
         }
 
-        private void ScanTask(double durationSeconds, double speedMmMin)
+        private void ScanTask(double scanLengthMm, double speedMmMin)
         {
-            Sensor.ForceStopMeasurement();
-            Sensor.SetDataTransfer(true);
-
-            Stopwatch sw = new Stopwatch();
-            sw.Start();
+            bool triggerAsserted = false;
+            bool dataTransferOn = false;
+            bool scanDone = false;
+            bool syncSeen = false;
+            string errorMessage = null;
+            string warningMessage = null;
+            // 握手关键时刻：用于联调标定超时参数
+            long? t0In6OnMs = null;
+            long? t1BusyOnMs = null;
+            long? t2SyncOnMs = null;
+            long? t3DoneOnMs = null;
+            long? t4BusyOffMs = null;
 
             int bufSize = 4000;
             DataNode[] buffer = new DataNode[bufSize];
+            var scanSw = new Stopwatch();
+            var phaseSw = Stopwatch.StartNew();
+            long nextUiUpdateMs = 0;
 
-            while (sw.Elapsed.TotalSeconds < durationSeconds && _isScanning)
+            double speedMmSec = speedMmMin / 60.0;
+            int expectedScanMs = (int)Math.Max(1000, (scanLengthMm / speedMmSec) * 1000.0);
+            int waitBusyTimeoutMs = 3000;
+            int waitSyncTimeoutMs = 3000;
+            int doneTimeoutMs = expectedScanMs * 3 + 5000;
+            int returnTimeoutMs = expectedScanMs * 2 + 10000;
+
+            try
             {
-                int count = Sensor.ReadBuffer(buffer, bufSize);
-                if (count > 0)
+                Sensor.ForceStopMeasurement();
+                Sensor.SetDataTransfer(true);
+                dataTransferOn = true;
+
+                McuSerialManager.Instance.SetInputBit(McuInputScanReqBit, true); // IN6=通
+                triggerAsserted = true;
+                t0In6OnMs = phaseSw.ElapsedMilliseconds;
+                AppendLog($"[时序] t0(IN6=通)={t0In6OnMs.Value}ms");
+                AppendLog("扫描触发已置位(IN6=通)，等待 BUSY...");
+
+                var waitBusy = Stopwatch.StartNew();
+                while (_isScanning && !McuSerialManager.Instance.GetOutputBit(McuOutputBusyBit))
                 {
-                    for (int i = 0; i < count; i++)
+                    if (McuSerialManager.Instance.GetOutputBit(McuOutputFaultBit))
                     {
-                        // 过滤通道1和DIST1类型
-                        if (buffer[i].cfg.channel == 1 && buffer[i].cfg.type == (int)SENSOR_OUTPUT_DATA.DIST1)
+                        throw new Exception("控制器 FAULT 置位，启动前中断。请检查控制器告警状态。");
+                    }
+
+                    if (waitBusy.ElapsedMilliseconds > waitBusyTimeoutMs)
+                    {
+                        throw new TimeoutException("等待 BUSY 超时：控制器未响应启动。");
+                    }
+                    Thread.Sleep(5);
+                }
+
+                if (!_isScanning)
+                {
+                    throw new OperationCanceledException("扫描已取消。");
+                }
+
+                t1BusyOnMs = phaseSw.ElapsedMilliseconds;
+                AppendLog($"[时序] t1(BUSY=1)={t1BusyOnMs.Value}ms");
+                AppendLog("BUSY 已置位，等待 SYNC 开采...");
+
+                var waitSync = Stopwatch.StartNew();
+                while (_isScanning && !McuSerialManager.Instance.GetOutputBit(McuOutputSyncBit))
+                {
+                    if (McuSerialManager.Instance.GetOutputBit(McuOutputFaultBit))
+                    {
+                        throw new Exception("控制器 FAULT 置位，等待 SYNC 时中断。请检查控制器告警状态。");
+                    }
+
+                    if (waitSync.ElapsedMilliseconds > waitSyncTimeoutMs)
+                    {
+                        throw new TimeoutException("等待 SYNC 超时：控制器未发出起点同步脉冲。");
+                    }
+                    Thread.Sleep(2);
+                }
+
+                if (!_isScanning)
+                {
+                    throw new OperationCanceledException("扫描已取消。");
+                }
+
+                syncSeen = true;
+                t2SyncOnMs = phaseSw.ElapsedMilliseconds;
+                AppendLog($"[时序] t2(SYNC=1)={t2SyncOnMs.Value}ms");
+                lock (_rawDataLock)
+                {
+                    _rawProfileData.Clear();
+                }
+                Interlocked.Exchange(ref _rawPointCount, 0);
+                scanSw.Restart();
+                AppendLog("已收到 SYNC，开始正式记录扫描数据。");
+
+                while (_isScanning)
+                {
+                    int count = Sensor.ReadBuffer(buffer, bufSize);
+                    if (count > 0)
+                    {
+                        for (int i = 0; i < count; i++)
                         {
-                            double val = buffer[i].data;
-                            // 基础过滤：剔除绝对错误码
-                            if (val > -1000 && val < 1000)
+                            if (buffer[i].cfg.channel == 1 && buffer[i].cfg.type == (int)SENSOR_OUTPUT_DATA.DIST1)
                             {
-                                _rawProfileData.Add(val);
+                                double val = buffer[i].data;
+                                if (val > -1000 && val < 1000)
+                                {
+                                    lock (_rawDataLock)
+                                    {
+                                        _rawProfileData.Add(val);
+                                    }
+                                    Interlocked.Increment(ref _rawPointCount);
+                                }
                             }
                         }
                     }
-                }
-                else Thread.Sleep(1);
+                    else
+                    {
+                        Thread.Sleep(1);
+                    }
 
-                // 更新进度
-                if (sw.ElapsedMilliseconds % 100 < 10)
+                    if (McuSerialManager.Instance.GetOutputBit(McuOutputFaultBit))
+                    {
+                        throw new Exception("控制器 FAULT 置位，扫描中断。采集已停止。");
+                    }
+
+                    if (McuSerialManager.Instance.GetOutputBit(McuOutputDoneBit))
+                    {
+                        scanDone = true;
+                        t3DoneOnMs = phaseSw.ElapsedMilliseconds;
+                        AppendLog($"[时序] t3(DONE=1)={t3DoneOnMs.Value}ms");
+                        AppendLog("收到 DONE，停止采集，等待电机回原位。");
+                        break;
+                    }
+
+                    if (scanSw.ElapsedMilliseconds > doneTimeoutMs)
+                    {
+                        throw new TimeoutException("扫描超时：未在预期时间内收到 DONE。\n请检查控制器程序或 IN6 配置。");
+                    }
+
+                    if (scanSw.ElapsedMilliseconds >= nextUiUpdateMs)
+                    {
+                        nextUiUpdateMs = scanSw.ElapsedMilliseconds + 100;
+                        int progress = (int)Math.Min(99, (scanSw.ElapsedMilliseconds * 100.0) / expectedScanMs);
+                        int points = Volatile.Read(ref _rawPointCount);
+                        this.BeginInvoke((MethodInvoker)delegate {
+                            progressBarScan.Value = progress;
+                            lblScanStatus.Text = $"扫描中... 点数:{points}";
+                        });
+                    }
+                }
+
+                Sensor.SetDataTransfer(false);
+                dataTransferOn = false;
+
+                if (syncSeen && scanDone)
                 {
-                    int progress = (int)((sw.ElapsedMilliseconds * 100) / (durationSeconds * 1000));
-                    if (progress > 100) progress = 100;
-                    this.BeginInvoke((MethodInvoker)delegate {
-                        progressBarScan.Value = progress;
-                        lblScanStatus.Text = $"采集点数: {_rawProfileData.Count}";
-                    });
+                    var waitReturn = Stopwatch.StartNew();
+                    while (_isScanning && McuSerialManager.Instance.GetOutputBit(McuOutputBusyBit))
+                    {
+                        if (McuSerialManager.Instance.GetOutputBit(McuOutputFaultBit))
+                        {
+                            warningMessage = "回原位阶段检测到 FAULT，请检查控制器状态。";
+                            break;
+                        }
+
+                        if (waitReturn.ElapsedMilliseconds > returnTimeoutMs)
+                        {
+                            warningMessage = "已完成采集，但等待 BUSY 复位超时。请确认电机回原位流程是否正常。";
+                            break;
+                        }
+                        Thread.Sleep(5);
+                    }
+                    if (!McuSerialManager.Instance.GetOutputBit(McuOutputBusyBit))
+                    {
+                        t4BusyOffMs = phaseSw.ElapsedMilliseconds;
+                        AppendLog($"[时序] t4(BUSY=0)={t4BusyOffMs.Value}ms");
+                    }
+                }
+                else
+                {
+                    throw new Exception("流程中断：未收到 DONE。\n采集结果已丢弃，请重试。");
+                }
+            }
+            catch (Exception ex)
+            {
+                errorMessage = ex.Message;
+            }
+            finally
+            {
+                if (dataTransferOn)
+                {
+                    Sensor.SetDataTransfer(false);
+                }
+                Sensor.ForceStopMeasurement();
+
+                if (triggerAsserted)
+                {
+                    McuSerialManager.Instance.SetInputBit(McuInputScanReqBit, false); // IN6=断
                 }
             }
 
-            double actualTime = sw.Elapsed.TotalSeconds;
-            sw.Stop();
-            Sensor.SetDataTransfer(false);
-            Sensor.ForceStopMeasurement();
+            AppendScanTimingLog(t0In6OnMs, t1BusyOnMs, t2SyncOnMs, t3DoneOnMs, t4BusyOffMs, errorMessage, warningMessage);
 
             this.BeginInvoke((MethodInvoker)delegate {
-                FinishScan(actualTime, speedMmMin);
+                FinishScan(scanLengthMm, speedMmMin, errorMessage, warningMessage);
             });
         }
 
         // ==========================================
         // 4. 数据处理与结果显示 (核心集成点)
         // ==========================================
-        private void FinishScan(double actualTime, double speedMmMin)
+        private void FinishScan(double scanLengthMm, double speedMmMin, string errorMessage, string warningMessage)
         {
             _isScanning = false;
             btnStartScan.Enabled = true; btnStartScan.Text = "开始扫描"; btnStartScan.BackColor = Color.LightGreen;
             progressBarScan.Visible = false;
 
-            if (_rawProfileData.Count < 100)
+            if (!string.IsNullOrEmpty(warningMessage))
+            {
+                AppendLog("[警告] " + warningMessage);
+            }
+
+            if (!string.IsNullOrEmpty(errorMessage))
+            {
+                lblScanStatus.Text = "扫描失败";
+                AppendLog("[错误] " + errorMessage);
+                MessageBox.Show(errorMessage, "扫描失败", MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                return;
+            }
+
+            double[] snapshot;
+            lock (_rawDataLock)
+            {
+                snapshot = _rawProfileData.ToArray();
+            }
+
+            if (snapshot.Length < 100)
             {
                 MessageBox.Show("采集数据过少，无法计算！", "警告");
                 return;
             }
 
             // 1. 数据清洗 (中值滤波去噪)
-            // 先去除极端的“蓝色矩形”噪点
-            var sorted = _rawProfileData.OrderBy(x => x).ToList();
+            var sorted = snapshot.OrderBy(x => x).ToList();
             double median = sorted[sorted.Count / 2];
-            List<double> validData = new List<double>();
-            foreach (var val in _rawProfileData)
+            List<double> validData = new List<double>(snapshot.Length);
+            foreach (var val in snapshot)
             {
                 if (Math.Abs(val - median) < 2.0) validData.Add(val);
             }
 
             if (validData.Count < 100) { MessageBox.Show("数据噪声过大，过滤后无效！"); return; }
 
-            // 2. 准备计算参数
+            // 2. 准备计算参数：握手模式下按计划扫描长度反推 dx
             double[] yData = validData.ToArray();
-            // 计算实际物理步长 dx
-            double speedMmSec = speedMmMin / 60.0;
-            double totalDist = speedMmSec * actualTime;
-            double dx = totalDist / yData.Length; // 强制拟合到实际走过的距离
+            double dx = scanLengthMm / Math.Max(1, yData.Length - 1);
 
             lblScanStatus.Text = $"完成. 点数:{yData.Length} dx:{dx:F6}mm";
             AppendLog($"开始计算粗糙度... dx={dx:F6}mm");
@@ -722,8 +918,59 @@ namespace ConfocalMeter
         }
         private void AppendLog(string msg)
         {
-            if (this.InvokeRequired) { this.Invoke(new Action<string>(AppendLog), msg); return; }
-            listBoxLog.Items.Add(msg); listBoxLog.TopIndex = listBoxLog.Items.Count - 1;
+            if (this.IsDisposed) return;
+            if (this.InvokeRequired)
+            {
+                this.BeginInvoke(new Action<string>(AppendLog), msg);
+                return;
+            }
+
+            listBoxLog.Items.Add(msg);
+            const int maxLogItems = 2000;
+            while (listBoxLog.Items.Count > maxLogItems)
+            {
+                listBoxLog.Items.RemoveAt(0);
+            }
+            listBoxLog.TopIndex = listBoxLog.Items.Count - 1;
+        }
+
+        private void AppendScanTimingLog(long? t0In6OnMs, long? t1BusyOnMs, long? t2SyncOnMs, long? t3DoneOnMs, long? t4BusyOffMs, string errorMessage, string warningMessage)
+        {
+            string state = string.IsNullOrEmpty(errorMessage) ? "OK" : "ERROR";
+            if (!string.IsNullOrEmpty(warningMessage) && state == "OK")
+            {
+                state = "WARN";
+            }
+
+            AppendLog(
+                $"[时序汇总][{state}] " +
+                $"t0(IN6=通)={FormatTimestampMs(t0In6OnMs)} " +
+                $"t1(BUSY=1)={FormatTimestampMs(t1BusyOnMs)} " +
+                $"t2(SYNC=1)={FormatTimestampMs(t2SyncOnMs)} " +
+                $"t3(DONE=1)={FormatTimestampMs(t3DoneOnMs)} " +
+                $"t4(BUSY=0)={FormatTimestampMs(t4BusyOffMs)}");
+
+            AppendLog(
+                $"[时序差] " +
+                $"T_busy={FormatDeltaMs(t0In6OnMs, t1BusyOnMs)} " +
+                $"T_sync={FormatDeltaMs(t1BusyOnMs, t2SyncOnMs)} " +
+                $"T_scan={FormatDeltaMs(t2SyncOnMs, t3DoneOnMs)} " +
+                $"T_return={FormatDeltaMs(t3DoneOnMs, t4BusyOffMs)} " +
+                $"T_total={FormatDeltaMs(t0In6OnMs, t4BusyOffMs)}");
+        }
+
+        private static string FormatTimestampMs(long? tMs)
+        {
+            return tMs.HasValue ? $"{tMs.Value}ms" : "N/A";
+        }
+
+        private static string FormatDeltaMs(long? startMs, long? endMs)
+        {
+            if (!startMs.HasValue || !endMs.HasValue || endMs.Value < startMs.Value)
+            {
+                return "N/A";
+            }
+            return $"{endMs.Value - startMs.Value}ms";
         }
         private void BtnOpenRawImage_Click(object sender, EventArgs e)
         {
@@ -806,3 +1053,11 @@ namespace ConfocalMeter
         }
     }
 }
+
+
+
+
+
+
+
+

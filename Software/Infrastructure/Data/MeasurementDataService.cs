@@ -1,36 +1,28 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Data.SQLite;
+using System.Globalization;
 using System.IO;
 using ConfocalMeter.Models;
 
 namespace ConfocalMeter.Infrastructure.Data
 {
     /// <summary>
-    /// 粗糙度测量数据服务 - SQLite 数据库操作
-    /// 提供测量记录的存储、查询和删除功能
+    /// 粗糙度测量数据服务 - SQLite 数据库操作。
     /// </summary>
     public class MeasurementDataService
     {
         private readonly string _dbPath;
         private readonly string _connectionString;
 
-        /// <summary>
-        /// 构造函数
-        /// </summary>
-        /// <param name="dbPath">数据库文件路径</param>
         public MeasurementDataService(string dbPath)
         {
             _dbPath = dbPath;
-            _connectionString = $"Data Source={_dbPath};Version=3;";
+            _connectionString = $"Data Source={_dbPath};Version=3;Journal Mode=WAL;BusyTimeout=5000;Pooling=True;";
         }
 
-        /// <summary>
-        /// 初始化数据库 - 创建表和索引
-        /// </summary>
         public void Initialize()
         {
-            // 确保目录存在
             string dir = Path.GetDirectoryName(_dbPath);
             if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir))
             {
@@ -41,11 +33,15 @@ namespace ConfocalMeter.Infrastructure.Data
             {
                 conn.Open();
 
-                // 创建测量记录表
+                using (var pragma = new SQLiteCommand("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;", conn))
+                {
+                    pragma.ExecuteNonQuery();
+                }
+
                 string createTableSql = @"
                     CREATE TABLE IF NOT EXISTS MeasurementRecords (
                         Id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        MeasurementTime DATETIME NOT NULL,
+                        MeasurementTime TEXT NOT NULL,
                         EvalLength REAL NOT NULL,
                         Interval REAL NOT NULL,
                         Speed REAL NOT NULL,
@@ -65,9 +61,8 @@ namespace ConfocalMeter.Infrastructure.Data
                     cmd.ExecuteNonQuery();
                 }
 
-                // 创建时间索引 (加速按日期查询)
                 string createIndexSql = @"
-                    CREATE INDEX IF NOT EXISTS idx_measurement_time 
+                    CREATE INDEX IF NOT EXISTS idx_measurement_time
                     ON MeasurementRecords(MeasurementTime);
                 ";
 
@@ -78,51 +73,44 @@ namespace ConfocalMeter.Infrastructure.Data
             }
         }
 
-        /// <summary>
-        /// 保存测量记录
-        /// </summary>
-        /// <param name="record">测量记录对象</param>
-        /// <returns>插入的记录 ID</returns>
         public long SaveRecord(MeasurementRecord record)
         {
             using (var conn = new SQLiteConnection(_connectionString))
             {
                 conn.Open();
-
-                string insertSql = @"
-                    INSERT INTO MeasurementRecords 
-                    (MeasurementTime, EvalLength, Interval, Speed, Ra, Rz, Mr1, Mr2, Rpk, Rvk, Rk, RawData)
-                    VALUES 
-                    (@time, @evalLength, @interval, @speed, @ra, @rz, @mr1, @mr2, @rpk, @rvk, @rk, @rawData);
-                    SELECT last_insert_rowid();
-                ";
-
-                using (var cmd = new SQLiteCommand(insertSql, conn))
+                using (var tx = conn.BeginTransaction())
                 {
-                    cmd.Parameters.AddWithValue("@time", record.MeasurementTime.ToString("yyyy-MM-dd HH:mm:ss"));
-                    cmd.Parameters.AddWithValue("@evalLength", record.EvalLength);
-                    cmd.Parameters.AddWithValue("@interval", record.Interval);
-                    cmd.Parameters.AddWithValue("@speed", record.Speed);
-                    cmd.Parameters.AddWithValue("@ra", record.Ra);
-                    cmd.Parameters.AddWithValue("@rz", record.Rz);
-                    cmd.Parameters.AddWithValue("@mr1", record.Mr1);
-                    cmd.Parameters.AddWithValue("@mr2", record.Mr2);
-                    cmd.Parameters.AddWithValue("@rpk", record.Rpk);
-                    cmd.Parameters.AddWithValue("@rvk", record.Rvk);
-                    cmd.Parameters.AddWithValue("@rk", record.Rk);
-                    cmd.Parameters.AddWithValue("@rawData", SerializeDoubleArray(record.RawData));
+                    string insertSql = @"
+                        INSERT INTO MeasurementRecords
+                        (MeasurementTime, EvalLength, Interval, Speed, Ra, Rz, Mr1, Mr2, Rpk, Rvk, Rk, RawData)
+                        VALUES
+                        (@time, @evalLength, @interval, @speed, @ra, @rz, @mr1, @mr2, @rpk, @rvk, @rk, @rawData);
+                        SELECT last_insert_rowid();
+                    ";
 
-                    return (long)cmd.ExecuteScalar();
+                    using (var cmd = new SQLiteCommand(insertSql, conn, tx))
+                    {
+                        cmd.Parameters.AddWithValue("@time", record.MeasurementTime.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture));
+                        cmd.Parameters.AddWithValue("@evalLength", record.EvalLength);
+                        cmd.Parameters.AddWithValue("@interval", record.Interval);
+                        cmd.Parameters.AddWithValue("@speed", record.Speed);
+                        cmd.Parameters.AddWithValue("@ra", record.Ra);
+                        cmd.Parameters.AddWithValue("@rz", record.Rz);
+                        cmd.Parameters.AddWithValue("@mr1", record.Mr1);
+                        cmd.Parameters.AddWithValue("@mr2", record.Mr2);
+                        cmd.Parameters.AddWithValue("@rpk", record.Rpk);
+                        cmd.Parameters.AddWithValue("@rvk", record.Rvk);
+                        cmd.Parameters.AddWithValue("@rk", record.Rk);
+                        cmd.Parameters.AddWithValue("@rawData", SerializeDoubleArray(record.RawData));
+
+                        long id = (long)cmd.ExecuteScalar();
+                        tx.Commit();
+                        return id;
+                    }
                 }
             }
         }
 
-        /// <summary>
-        /// 按日期范围查询记录 (轻量级，不含 RawData)
-        /// </summary>
-        /// <param name="start">开始日期</param>
-        /// <param name="end">结束日期</param>
-        /// <returns>记录列表</returns>
         public List<MeasurementRecordDTO> QueryByDateRange(DateTime start, DateTime end)
         {
             var results = new List<MeasurementRecordDTO>();
@@ -131,7 +119,6 @@ namespace ConfocalMeter.Infrastructure.Data
             {
                 conn.Open();
 
-                // 不查询 RawData 以提高速度
                 string querySql = @"
                     SELECT Id, MeasurementTime, EvalLength, Interval, Speed, Ra, Rz, Mr1, Mr2, Rpk, Rvk, Rk
                     FROM MeasurementRecords
@@ -141,8 +128,8 @@ namespace ConfocalMeter.Infrastructure.Data
 
                 using (var cmd = new SQLiteCommand(querySql, conn))
                 {
-                    cmd.Parameters.AddWithValue("@start", start.ToString("yyyy-MM-dd 00:00:00"));
-                    cmd.Parameters.AddWithValue("@end", end.ToString("yyyy-MM-dd 23:59:59"));
+                    cmd.Parameters.AddWithValue("@start", start.ToString("yyyy-MM-dd 00:00:00", CultureInfo.InvariantCulture));
+                    cmd.Parameters.AddWithValue("@end", end.ToString("yyyy-MM-dd 23:59:59", CultureInfo.InvariantCulture));
 
                     using (var reader = cmd.ExecuteReader())
                     {
@@ -151,7 +138,7 @@ namespace ConfocalMeter.Infrastructure.Data
                             results.Add(new MeasurementRecordDTO
                             {
                                 Id = reader.GetInt64(0),
-                                MeasurementTime = DateTime.Parse(reader.GetString(1)),
+                                MeasurementTime = DateTime.ParseExact(reader.GetString(1), "yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
                                 EvalLength = reader.GetDouble(2),
                                 Interval = reader.GetDouble(3),
                                 Speed = reader.GetDouble(4),
@@ -171,11 +158,6 @@ namespace ConfocalMeter.Infrastructure.Data
             return results;
         }
 
-        /// <summary>
-        /// 按 ID 加载原始数据 (用于波形回放)
-        /// </summary>
-        /// <param name="id">记录 ID</param>
-        /// <returns>原始高度数组</returns>
         public double[] LoadRawData(long id)
         {
             using (var conn = new SQLiteConnection(_connectionString))
@@ -199,12 +181,6 @@ namespace ConfocalMeter.Infrastructure.Data
             return null;
         }
 
-        /// <summary>
-        /// 按日期范围删除记录
-        /// </summary>
-        /// <param name="start">开始日期</param>
-        /// <param name="end">结束日期</param>
-        /// <returns>删除的记录数</returns>
         public int DeleteByDateRange(DateTime start, DateTime end)
         {
             using (var conn = new SQLiteConnection(_connectionString))
@@ -218,18 +194,14 @@ namespace ConfocalMeter.Infrastructure.Data
 
                 using (var cmd = new SQLiteCommand(deleteSql, conn))
                 {
-                    cmd.Parameters.AddWithValue("@start", start.ToString("yyyy-MM-dd 00:00:00"));
-                    cmd.Parameters.AddWithValue("@end", end.ToString("yyyy-MM-dd 23:59:59"));
+                    cmd.Parameters.AddWithValue("@start", start.ToString("yyyy-MM-dd 00:00:00", CultureInfo.InvariantCulture));
+                    cmd.Parameters.AddWithValue("@end", end.ToString("yyyy-MM-dd 23:59:59", CultureInfo.InvariantCulture));
 
                     return cmd.ExecuteNonQuery();
                 }
             }
         }
 
-        /// <summary>
-        /// 获取记录总数
-        /// </summary>
-        /// <returns>记录数</returns>
         public long GetRecordCount()
         {
             using (var conn = new SQLiteConnection(_connectionString))
@@ -243,25 +215,16 @@ namespace ConfocalMeter.Infrastructure.Data
             }
         }
 
-        #region 序列化辅助方法
-
-        /// <summary>
-        /// 将 double[] 序列化为 byte[] (BLOB 存储)
-        /// </summary>
         private byte[] SerializeDoubleArray(double[] data)
         {
             if (data == null || data.Length == 0)
                 return null;
 
-            // 每个 double 占用 8 字节
             byte[] bytes = new byte[data.Length * sizeof(double)];
             Buffer.BlockCopy(data, 0, bytes, 0, bytes.Length);
             return bytes;
         }
 
-        /// <summary>
-        /// 将 byte[] 反序列化为 double[]
-        /// </summary>
         private double[] DeserializeDoubleArray(byte[] bytes)
         {
             if (bytes == null || bytes.Length == 0)
@@ -271,7 +234,5 @@ namespace ConfocalMeter.Infrastructure.Data
             Buffer.BlockCopy(bytes, 0, data, 0, bytes.Length);
             return data;
         }
-
-        #endregion
     }
 }

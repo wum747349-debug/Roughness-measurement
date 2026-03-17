@@ -1,4 +1,4 @@
-using System;
+﻿using System;
 using System.Collections.Generic;
 using System.Drawing;
 using System.Windows.Forms;
@@ -9,15 +9,13 @@ using ConfocalMeter.Infrastructure.Data;
 namespace ConfocalMeter.Presentation.Forms
 {
     /// <summary>
-    /// 历史记录管理窗体 - 查询、查看和删除测量记录
-    /// 采用三段式布局：筛选区、列表区、详情/回放区
+    /// 历史记录管理窗体 - 查询、查看和删除测量记录。
     /// </summary>
     public partial class HistoryForm : Form
     {
-        private MeasurementDataService _dataService;
+        private readonly MeasurementDataService _dataService;
         private List<MeasurementRecordDTO> _currentRecords;
 
-        // --- UI 控件 ---
         // 顶部筛选区
         private Panel panelFilter;
         private DateTimePicker dtpStart, dtpEnd;
@@ -33,6 +31,13 @@ namespace ConfocalMeter.Presentation.Forms
         private PropertyGrid propGridDetail;
         private Chart chartReplay;
 
+        // 历史回放显示缓冲（仅 UI 线程访问）
+        private const int REPLAY_RING_CAPACITY = 400000;
+        private readonly double[] _replayRing = new double[REPLAY_RING_CAPACITY];
+        private int _replayHead = 0;
+        private int _replayCount = 0;
+        private double _replayDx = 0.001;
+
         public HistoryForm(MeasurementDataService dataService)
         {
             _dataService = dataService;
@@ -41,13 +46,11 @@ namespace ConfocalMeter.Presentation.Forms
 
         private void InitializeUI()
         {
-            // 窗体基本设置
             this.Text = "历史记录管理";
             this.Size = new Size(1200, 700);
             this.StartPosition = FormStartPosition.CenterParent;
             this.MinimumSize = new Size(900, 500);
 
-            // 顶部筛选区
             panelFilter = new Panel
             {
                 Dock = DockStyle.Top,
@@ -61,7 +64,7 @@ namespace ConfocalMeter.Presentation.Forms
                 Location = new Point(75, 12),
                 Width = 120,
                 Format = DateTimePickerFormat.Short,
-                Value = DateTime.Today.AddDays(-30) // 默认查询最近 30 天
+                Value = DateTime.Today.AddDays(-30)
             };
 
             var lblEnd = new Label { Text = "结束日期:", AutoSize = true, Location = new Point(210, 15) };
@@ -113,17 +116,14 @@ namespace ConfocalMeter.Presentation.Forms
                 btnQuery, btnDelete, btnExport, lblRecordCount
             });
 
-            // 主分割容器
             splitMain = new SplitContainer
             {
                 Dock = DockStyle.Fill,
                 Orientation = Orientation.Vertical,
-                // 先不设置 SplitterDistance，防止初始化时因宽度不足报错
-                Panel1MinSize = 100, // 减小最小限制
+                Panel1MinSize = 100,
                 Panel2MinSize = 100
             };
 
-            // 左侧：数据列表
             dgvRecords = new DataGridView
             {
                 Dock = DockStyle.Fill,
@@ -136,7 +136,6 @@ namespace ConfocalMeter.Presentation.Forms
             };
             dgvRecords.SelectionChanged += DgvRecords_SelectionChanged;
 
-            // 设置列
             dgvRecords.Columns.Add("Id", "ID");
             dgvRecords.Columns.Add("MeasurementTime", "测量时间");
             dgvRecords.Columns.Add("Ra", "Ra (μm)");
@@ -151,10 +150,8 @@ namespace ConfocalMeter.Presentation.Forms
 
             splitMain.Panel1.Controls.Add(dgvRecords);
 
-            // 右侧：详情 Tab
             tabDetail = new TabControl { Dock = DockStyle.Fill };
 
-            // Tab1: 参数详情
             var tabParams = new TabPage("参数详情");
             propGridDetail = new PropertyGrid
             {
@@ -163,7 +160,6 @@ namespace ConfocalMeter.Presentation.Forms
             };
             tabParams.Controls.Add(propGridDetail);
 
-            // Tab2: 波形回放
             var tabChart = new TabPage("波形回放");
             chartReplay = new Chart { Dock = DockStyle.Fill };
             var area = new ChartArea("main");
@@ -171,7 +167,13 @@ namespace ConfocalMeter.Presentation.Forms
             area.AxisY.Title = "高度 (mm)";
             area.AxisY.IsStartedFromZero = false;
             chartReplay.ChartAreas.Add(area);
-            chartReplay.Series.Add(new Series("原始轮廓") { ChartType = SeriesChartType.Line, Color = Color.Blue, BorderWidth = 2 });
+            chartReplay.Series.Add(new Series("原始轮廓")
+            {
+                ChartType = SeriesChartType.FastLine,
+                Color = Color.Blue,
+                BorderWidth = 2
+            });
+            chartReplay.Resize += (s, e) => PlotReplayFromRing();
             tabChart.Controls.Add(chartReplay);
 
             tabDetail.TabPages.Add(tabParams);
@@ -179,20 +181,13 @@ namespace ConfocalMeter.Presentation.Forms
 
             splitMain.Panel2.Controls.Add(tabDetail);
 
-            // 添加到窗体
             this.Controls.Add(splitMain);
             this.Controls.Add(panelFilter);
-
-            // 安全设置分割位置 (在控件有尺寸后)
             splitMain.SplitterDistance = 500;
 
-            // 初始加载
             LoadRecords();
         }
 
-        /// <summary>
-        /// 加载记录列表
-        /// </summary>
         private void LoadRecords()
         {
             try
@@ -242,7 +237,9 @@ namespace ConfocalMeter.Presentation.Forms
                 {
                     int deleted = _dataService.DeleteByDateRange(dtpStart.Value, dtpEnd.Value);
                     MessageBox.Show($"成功删除 {deleted} 条记录。", "删除完成");
-                    LoadRecords(); // 刷新列表
+                    LoadRecords();
+                    ClearReplayRing();
+                    chartReplay.Series["原始轮廓"].Points.Clear();
                 }
                 catch (Exception ex)
                 {
@@ -270,10 +267,8 @@ namespace ConfocalMeter.Presentation.Forms
                     {
                         using (var writer = new System.IO.StreamWriter(sfd.FileName, false, System.Text.Encoding.UTF8))
                         {
-                            // 写入表头
                             writer.WriteLine("ID,测量时间,评定长度(mm),间隔(mm),速度(mm/min),Ra(μm),Rz(μm),Mr1(%),Mr2(%),Rpk(μm),Rvk(μm),Rk(μm)");
 
-                            // 写入数据
                             foreach (var rec in _currentRecords)
                             {
                                 writer.WriteLine($"{rec.Id},{rec.MeasurementTime:yyyy-MM-dd HH:mm:ss},{rec.EvalLength:F3},{rec.Interval:F6},{rec.Speed:F1},{rec.Ra:F3},{rec.Rz:F3},{rec.Mr1:F2},{rec.Mr2:F2},{rec.Rpk:F3},{rec.Rvk:F3},{rec.Rk:F3}");
@@ -301,10 +296,7 @@ namespace ConfocalMeter.Presentation.Forms
 
                 if (selectedRecord != null)
                 {
-                    // 更新 PropertyGrid
                     propGridDetail.SelectedObject = selectedRecord;
-
-                    // 加载波形数据并绘制
                     LoadAndPlotRawData(id);
                 }
             }
@@ -314,9 +306,6 @@ namespace ConfocalMeter.Presentation.Forms
             }
         }
 
-        /// <summary>
-        /// 加载原始波形并绘制图表
-        /// </summary>
         private void LoadAndPlotRawData(long id)
         {
             try
@@ -324,29 +313,109 @@ namespace ConfocalMeter.Presentation.Forms
                 double[] rawData = _dataService.LoadRawData(id);
                 if (rawData == null || rawData.Length == 0)
                 {
+                    ClearReplayRing();
                     chartReplay.Series["原始轮廓"].Points.Clear();
                     return;
                 }
 
                 var selectedRecord = _currentRecords?.Find(r => r.Id == id);
-                double dx = selectedRecord?.Interval ?? 0.001;
+                _replayDx = selectedRecord?.Interval ?? 0.001;
 
-                // 清除旧数据
-                chartReplay.Series["原始轮廓"].Points.Clear();
-
-                // 绘制新数据
+                ClearReplayRing();
                 for (int i = 0; i < rawData.Length; i++)
                 {
-                    double x = i * dx;
-                    chartReplay.Series["原始轮廓"].Points.AddXY(x, rawData[i]);
+                    AddReplaySample(rawData[i]);
                 }
 
-                chartReplay.ChartAreas[0].RecalculateAxesScale();
+                PlotReplayFromRing();
             }
             catch (Exception ex)
             {
                 System.Diagnostics.Debug.WriteLine($"加载波形数据失败: {ex.Message}");
             }
+        }
+
+        private void PlotReplayFromRing()
+        {
+            var series = chartReplay.Series["原始轮廓"];
+            if (_replayCount == 0)
+            {
+                series.Points.Clear();
+                return;
+            }
+
+            int pixelBuckets = Math.Max(300, chartReplay.ClientSize.Width - 80);
+            int samplesPerBucket = Math.Max(1, (int)Math.Ceiling(_replayCount / (double)pixelBuckets));
+            int bucketCount = (int)Math.Ceiling(_replayCount / (double)samplesPerBucket);
+
+            series.Points.SuspendUpdates();
+            series.Points.Clear();
+
+            int oldest = GetReplayOldestIndex();
+            for (int b = 0; b < bucketCount; b++)
+            {
+                int start = b * samplesPerBucket;
+                int end = Math.Min(_replayCount, start + samplesPerBucket);
+                if (start >= end) break;
+
+                double minV = double.MaxValue;
+                double maxV = double.MinValue;
+                int minI = start;
+                int maxI = start;
+
+                for (int i = start; i < end; i++)
+                {
+                    int ringIndex = (oldest + i) % REPLAY_RING_CAPACITY;
+                    double v = _replayRing[ringIndex];
+                    if (v < minV)
+                    {
+                        minV = v;
+                        minI = i;
+                    }
+                    if (v > maxV)
+                    {
+                        maxV = v;
+                        maxI = i;
+                    }
+                }
+
+                if (minI <= maxI)
+                {
+                    series.Points.AddXY(minI * _replayDx, minV);
+                    if (minI != maxI || Math.Abs(maxV - minV) > double.Epsilon)
+                        series.Points.AddXY(maxI * _replayDx, maxV);
+                }
+                else
+                {
+                    series.Points.AddXY(maxI * _replayDx, maxV);
+                    if (minI != maxI || Math.Abs(maxV - minV) > double.Epsilon)
+                        series.Points.AddXY(minI * _replayDx, minV);
+                }
+            }
+
+            series.Points.ResumeUpdates();
+            chartReplay.ChartAreas[0].RecalculateAxesScale();
+        }
+
+        private void AddReplaySample(double value)
+        {
+            _replayRing[_replayHead] = value;
+            _replayHead = (_replayHead + 1) % REPLAY_RING_CAPACITY;
+            if (_replayCount < REPLAY_RING_CAPACITY)
+            {
+                _replayCount++;
+            }
+        }
+
+        private int GetReplayOldestIndex()
+        {
+            return (_replayHead - _replayCount + REPLAY_RING_CAPACITY) % REPLAY_RING_CAPACITY;
+        }
+
+        private void ClearReplayRing()
+        {
+            _replayHead = 0;
+            _replayCount = 0;
         }
     }
 }

@@ -4,8 +4,6 @@ using System.Threading;
 using System.Windows.Forms;
 using System.Windows.Forms.DataVisualization.Charting;
 using System.Collections.Concurrent;
-using System.Collections.Generic;
-using System.Linq;
 using System.Diagnostics;
 using tscmccs;
 
@@ -24,14 +22,19 @@ namespace ConfocalMeter
         private Thread _daqThread;
         private System.Windows.Forms.Timer _uiTimer;
 
-        // 数据队列
-        private ConcurrentQueue<DataPointObj> _dataQueue = new ConcurrentQueue<DataPointObj>();
-        private List<DataPointObj> _displayBuffer = new List<DataPointObj>(); // 本地缓存用于绘图
+        // 采集队列（线程间）
+        private readonly ConcurrentQueue<DataPointObj> _dataQueue = new ConcurrentQueue<DataPointObj>();
+
+        // 显示缓冲（仅 UI 线程访问）
+        private const int DISPLAY_RING_CAPACITY = 120000;
+        private readonly DataPointObj[] _displayRing = new DataPointObj[DISPLAY_RING_CAPACITY];
+        private int _ringHead = 0;   // 下一个写入位置
+        private int _ringCount = 0;  // 当前有效点数
 
         // 状态变量
-        private Stopwatch _stopwatch = new Stopwatch();
+        private readonly Stopwatch _stopwatch = new Stopwatch();
         private double _zeroOffset = 0.0;
-        private const double VIEW_WINDOW = 10.0; // 滚动窗口 10秒
+        private const double VIEW_WINDOW = 10.0; // 滚动窗口 10 秒
 
         private struct DataPointObj
         {
@@ -71,13 +74,11 @@ namespace ConfocalMeter
 
             topPanel.Controls.AddRange(new Control[] { btnStart, btnStop, btnTare, chkAutoY, lblCurrentVal, lblStats });
 
-            // --- 图表配置 ---
             chartDist = new Chart();
             chartDist.Dock = DockStyle.Fill;
             ChartArea area = new ChartArea("ScopeArea");
-            area.BackColor = Color.Black; // 深色背景
+            area.BackColor = Color.Black;
 
-            // --- X轴设置 ---
             area.AxisX.Title = "时间 (s)";
             area.AxisX.TitleForeColor = Color.LightGray;
             area.AxisX.LabelStyle.ForeColor = Color.White;
@@ -86,7 +87,6 @@ namespace ConfocalMeter
             area.AxisX.MajorGrid.LineDashStyle = ChartDashStyle.Dash;
             area.AxisX.LabelStyle.Format = "F1";
 
-            // --- Y轴设置 ---
             area.AxisY.Title = "距离 (mm)";
             area.AxisY.TitleForeColor = Color.Cyan;
             area.AxisY.LabelStyle.ForeColor = Color.Cyan;
@@ -115,16 +115,15 @@ namespace ConfocalMeter
             return new Button() { Text = text, Location = new Point(x, y), Width = 100, Height = 40, BackColor = bg, FlatStyle = FlatStyle.Flat, Font = new Font("微软雅黑", 9, FontStyle.Bold) };
         }
 
-        // --- 逻辑控制 ---
-
         private void BtnStart_Click(object sender, EventArgs e)
         {
             if (_isMeasuring) return;
             _isMeasuring = true;
-            btnStart.Enabled = false; btnStop.Enabled = true;
+            btnStart.Enabled = false;
+            btnStop.Enabled = true;
 
-            while (_dataQueue.TryDequeue(out _)) ;
-            _displayBuffer.Clear();
+            while (_dataQueue.TryDequeue(out _)) { }
+            ClearDisplayRing();
             chartDist.Series[0].Points.Clear();
 
             _zeroOffset = 0;
@@ -144,21 +143,23 @@ namespace ConfocalMeter
             _uiTimer.Stop();
             _stopwatch.Stop();
             MainForm.Sensor.SetDataTransfer(false);
-            btnStart.Enabled = true; btnStop.Enabled = false;
+            btnStart.Enabled = true;
+            btnStop.Enabled = false;
         }
 
         private void BtnTare_Click(object sender, EventArgs e)
         {
-            if (_displayBuffer.Count > 0)
+            if (TryGetLatestPoint(out DataPointObj latest))
             {
-                double currentAbs = _displayBuffer.Last().Value + _zeroOffset;
+                double currentAbs = latest.Value + _zeroOffset;
                 _zeroOffset = currentAbs;
-                _displayBuffer.Clear();
+                ClearDisplayRing();
                 chartDist.Series[0].Points.Clear();
+                lblCurrentVal.Text = "0.0000 mm";
+                lblStats.Text = "P-P(波动): --";
             }
         }
 
-        // --- 采集线程 (关键修复：加入通道过滤) ---
         private void DaqLoop()
         {
             int bufSize = 1000;
@@ -171,15 +172,9 @@ namespace ConfocalMeter
                 {
                     for (int i = 0; i < count; i++)
                     {
-                        // ========================================================
-                        // 【核心修复】过滤 Channel 0 (时间戳)
-                        // 只保留 Channel 1 (DIST1)
-                        // ========================================================
                         if (buffer[i].cfg.channel == 1 && buffer[i].cfg.type == (int)SENSOR_OUTPUT_DATA.DIST1)
                         {
                             double val = buffer[i].data;
-
-                            // 过滤无效值
                             if (val > -1000 && val < 1000)
                             {
                                 double t = _stopwatch.Elapsed.TotalSeconds;
@@ -188,84 +183,140 @@ namespace ConfocalMeter
                         }
                     }
                 }
-                else Thread.Sleep(1);
+                else
+                {
+                    Thread.Sleep(1);
+                }
             }
         }
 
-        // --- UI 刷新 ---
         private void UiTimer_Tick(object sender, EventArgs e)
         {
-            int count = _dataQueue.Count;
-            if (count == 0) return;
-
             int limit = 3000;
             int processed = 0;
 
             while (processed < limit && _dataQueue.TryDequeue(out DataPointObj pt))
             {
                 pt.Value -= _zeroOffset;
-                _displayBuffer.Add(pt);
+                AddToDisplayRing(pt);
                 processed++;
             }
 
-            // 1. 移除过期数据 (实现向左滚动)
-            if (_displayBuffer.Count > 0)
+            if (!TryGetLatestPoint(out DataPointObj latest))
             {
-                double lastTime = _displayBuffer.Last().Time;
+                return;
+            }
 
-                int removeCount = 0;
-                while (removeCount < 500 && _displayBuffer.Count > 0 && _displayBuffer[0].Time < (lastTime - VIEW_WINDOW))
+            RenderWave(latest.Time);
+            lblCurrentVal.Text = $"{latest.Value:F4} mm";
+        }
+
+        private void RenderWave(double latestTime)
+        {
+            double windowStart = Math.Max(0, latestTime - VIEW_WINDOW);
+            int bucketCount = Math.Max(200, chartDist.ClientSize.Width - 80);
+
+            bool[] hasBucket = new bool[bucketCount];
+            double[] minVal = new double[bucketCount];
+            double[] maxVal = new double[bucketCount];
+            double[] minTime = new double[bucketCount];
+            double[] maxTime = new double[bucketCount];
+
+            double visibleMin = double.MaxValue;
+            double visibleMax = double.MinValue;
+            int visiblePoints = 0;
+
+            int oldest = GetOldestIndex();
+            for (int i = 0; i < _ringCount; i++)
+            {
+                int idx = (oldest + i) % DISPLAY_RING_CAPACITY;
+                var pt = _displayRing[idx];
+
+                if (pt.Time < windowStart || pt.Time > latestTime)
                 {
-                    _displayBuffer.RemoveAt(0);
-                    removeCount++;
+                    continue;
                 }
 
-                // 2. 绘制
-                chartDist.Series[0].Points.SuspendUpdates();
-                chartDist.Series[0].Points.Clear();
-                for (int i = 0; i < _displayBuffer.Count; i++)
-                {
-                    chartDist.Series[0].Points.AddXY(_displayBuffer[i].Time, _displayBuffer[i].Value);
-                }
-                chartDist.Series[0].Points.ResumeUpdates();
+                visiblePoints++;
+                if (pt.Value < visibleMin) visibleMin = pt.Value;
+                if (pt.Value > visibleMax) visibleMax = pt.Value;
 
-                // 3. 更新数值
-                lblCurrentVal.Text = $"{_displayBuffer.Last().Value:F4} mm";
+                int bucket = (int)((pt.Time - windowStart) / VIEW_WINDOW * (bucketCount - 1));
+                if (bucket < 0) bucket = 0;
+                if (bucket >= bucketCount) bucket = bucketCount - 1;
 
-                // 4. X轴滚动
-                if (lastTime > VIEW_WINDOW)
+                if (!hasBucket[bucket])
                 {
-                    chartDist.ChartAreas[0].AxisX.Minimum = lastTime - VIEW_WINDOW;
-                    chartDist.ChartAreas[0].AxisX.Maximum = lastTime;
+                    hasBucket[bucket] = true;
+                    minVal[bucket] = maxVal[bucket] = pt.Value;
+                    minTime[bucket] = maxTime[bucket] = pt.Time;
                 }
                 else
                 {
-                    chartDist.ChartAreas[0].AxisX.Minimum = 0;
-                    chartDist.ChartAreas[0].AxisX.Maximum = VIEW_WINDOW;
+                    if (pt.Value < minVal[bucket])
+                    {
+                        minVal[bucket] = pt.Value;
+                        minTime[bucket] = pt.Time;
+                    }
+                    if (pt.Value > maxVal[bucket])
+                    {
+                        maxVal[bucket] = pt.Value;
+                        maxTime[bucket] = pt.Time;
+                    }
                 }
+            }
 
-                // 5. Y轴自适应
-                if (chkAutoY.Checked)
+            var points = chartDist.Series[0].Points;
+            points.SuspendUpdates();
+            points.Clear();
+
+            if (visiblePoints > 0)
+            {
+                for (int b = 0; b < bucketCount; b++)
                 {
-                    UpdateYAxisHighSensitivity(_displayBuffer);
+                    if (!hasBucket[b]) continue;
+
+                    if (minTime[b] <= maxTime[b])
+                    {
+                        points.AddXY(minTime[b], minVal[b]);
+                        if (maxTime[b] != minTime[b] || maxVal[b] != minVal[b])
+                            points.AddXY(maxTime[b], maxVal[b]);
+                    }
+                    else
+                    {
+                        points.AddXY(maxTime[b], maxVal[b]);
+                        if (maxTime[b] != minTime[b] || maxVal[b] != minVal[b])
+                            points.AddXY(minTime[b], minVal[b]);
+                    }
                 }
+            }
+
+            points.ResumeUpdates();
+
+            if (latestTime > VIEW_WINDOW)
+            {
+                chartDist.ChartAreas[0].AxisX.Minimum = latestTime - VIEW_WINDOW;
+                chartDist.ChartAreas[0].AxisX.Maximum = latestTime;
+            }
+            else
+            {
+                chartDist.ChartAreas[0].AxisX.Minimum = 0;
+                chartDist.ChartAreas[0].AxisX.Maximum = VIEW_WINDOW;
+            }
+
+            if (chkAutoY.Checked && visiblePoints > 0)
+            {
+                UpdateYAxisHighSensitivity(visibleMin, visibleMax);
+            }
+            else if (visiblePoints > 0)
+            {
+                lblStats.Text = $"P-P(波动): {(visibleMax - visibleMin):F4} mm";
             }
         }
 
-        private void UpdateYAxisHighSensitivity(List<DataPointObj> data)
+        private void UpdateYAxisHighSensitivity(double min, double max)
         {
-            if (data.Count == 0) return;
-            double max = double.MinValue;
-            double min = double.MaxValue;
-
-            foreach (var pt in data)
-            {
-                if (pt.Value > max) max = pt.Value;
-                if (pt.Value < min) min = pt.Value;
-            }
-
             double range = max - min;
-            // 最小显示 1微米，防止完全直线时显示异常
             if (range < 0.001) range = 0.001;
 
             double center = (max + min) / 2.0;
@@ -275,6 +326,40 @@ namespace ConfocalMeter
             chartDist.ChartAreas[0].AxisY.Minimum = center - span / 2.0;
 
             lblStats.Text = $"P-P(波动): {(max - min):F4} mm";
+        }
+
+        private void AddToDisplayRing(DataPointObj pt)
+        {
+            _displayRing[_ringHead] = pt;
+            _ringHead = (_ringHead + 1) % DISPLAY_RING_CAPACITY;
+            if (_ringCount < DISPLAY_RING_CAPACITY)
+            {
+                _ringCount++;
+            }
+        }
+
+        private bool TryGetLatestPoint(out DataPointObj pt)
+        {
+            if (_ringCount == 0)
+            {
+                pt = default(DataPointObj);
+                return false;
+            }
+
+            int idx = (_ringHead - 1 + DISPLAY_RING_CAPACITY) % DISPLAY_RING_CAPACITY;
+            pt = _displayRing[idx];
+            return true;
+        }
+
+        private int GetOldestIndex()
+        {
+            return (_ringHead - _ringCount + DISPLAY_RING_CAPACITY) % DISPLAY_RING_CAPACITY;
+        }
+
+        private void ClearDisplayRing()
+        {
+            _ringHead = 0;
+            _ringCount = 0;
         }
     }
 }
