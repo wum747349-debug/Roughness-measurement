@@ -76,7 +76,8 @@ namespace ConfocalMeter
         private List<double> _rawProfileData = new List<double>(); // 原始采集数据
         private readonly object _rawDataLock = new object();
         private int _rawPointCount = 0;
-        private const int McuInputScanReqBit = 0; // IN6
+        private bool? _lastMcuCommHealthy = null;
+        private const int McuInputScanReqBit = 0; // IN11
         private const int McuOutputBusyBit = 0;   // OUT1(BUSY)
         private const int McuOutputSyncBit = 1;   // OUT2(SYNC)
         private const int McuOutputDoneBit = 2;   // OUT3(DONE)
@@ -401,12 +402,11 @@ namespace ConfocalMeter
         // ==========================================
         private void BtnStartScan_Click(object sender, EventArgs e)
         {
-            if (!Sensor.IsConnected) { MessageBox.Show("请先连接设备！"); return; }
             if (_isScanning) return;
 
             if (!McuSerialManager.Instance.IsOpen)
             {
-                MessageBox.Show("请先打开 MCU 串口（用于 IN6/OUT1/OUT2 握手）！", "提示");
+                MessageBox.Show("请先打开 MCU 串口（用于 IN11/OUT1/OUT2 握手）！", "提示");
                 return;
             }
 
@@ -425,9 +425,17 @@ namespace ConfocalMeter
                 return;
             }
 
-            // 下发采样
-            SAMPLING_INTERVAL intervalEnum = (SAMPLING_INTERVAL)cmbRoughnessSampling.SelectedIndex;
-            Sensor.SetSamplingInterval(intervalEnum);
+            bool sensorAvailable = Sensor.IsConnected;
+            if (sensorAvailable)
+            {
+                // 下发采样
+                SAMPLING_INTERVAL intervalEnum = (SAMPLING_INTERVAL)cmbRoughnessSampling.SelectedIndex;
+                Sensor.SetSamplingInterval(intervalEnum);
+            }
+            else
+            {
+                AppendLog("[联调模式] 未连接光谱共焦传感器：本次仅执行握手时序与电机联调，跳过粗糙度计算。");
+            }
 
             // 准备
             _isScanning = true;
@@ -449,12 +457,12 @@ namespace ConfocalMeter
             progressBarScan.Value = 0;
             lblScanStatus.Text = "握手中...等待 BUSY";
 
-            _scanThread = new Thread(() => ScanTask(lengthMm, speedMmMin));
+            _scanThread = new Thread(() => ScanTask(lengthMm, speedMmMin, sensorAvailable));
             _scanThread.IsBackground = true;
             _scanThread.Start();
         }
 
-        private void ScanTask(double scanLengthMm, double speedMmMin)
+        private void ScanTask(double scanLengthMm, double speedMmMin, bool sensorAvailable)
         {
             bool triggerAsserted = false;
             bool dataTransferOn = false;
@@ -477,22 +485,25 @@ namespace ConfocalMeter
 
             double speedMmSec = speedMmMin / 60.0;
             int expectedScanMs = (int)Math.Max(1000, (scanLengthMm / speedMmSec) * 1000.0);
-            int waitBusyTimeoutMs = 3000;
-            int waitSyncTimeoutMs = 3000;
-            int doneTimeoutMs = expectedScanMs * 3 + 5000;
-            int returnTimeoutMs = expectedScanMs * 2 + 10000;
+            int waitBusyTimeoutMs = 1000;
+            int waitSyncTimeoutMs = 1000;
+            int doneTimeoutMs = expectedScanMs * 2 + 1000;
+            int returnTimeoutMs = expectedScanMs * 2 + 2000;
 
             try
             {
-                Sensor.ForceStopMeasurement();
-                Sensor.SetDataTransfer(true);
-                dataTransferOn = true;
+                if (sensorAvailable)
+                {
+                    Sensor.ForceStopMeasurement();
+                    Sensor.SetDataTransfer(true);
+                    dataTransferOn = true;
+                }
 
-                McuSerialManager.Instance.SetInputBit(McuInputScanReqBit, true); // IN6=通
+                McuSerialManager.Instance.SetInputBit(McuInputScanReqBit, true); // IN11=通
                 triggerAsserted = true;
                 t0In6OnMs = phaseSw.ElapsedMilliseconds;
-                AppendLog($"[时序] t0(IN6=通)={t0In6OnMs.Value}ms");
-                AppendLog("扫描触发已置位(IN6=通)，等待 BUSY...");
+                AppendLog($"[时序] t0(IN11=通)={t0In6OnMs.Value}ms");
+                AppendLog("扫描触发已置位(IN11=通)，等待 BUSY...");
 
                 var waitBusy = Stopwatch.StartNew();
                 while (_isScanning && !McuSerialManager.Instance.GetOutputBit(McuOutputBusyBit))
@@ -551,7 +562,12 @@ namespace ConfocalMeter
 
                 while (_isScanning)
                 {
-                    int count = Sensor.ReadBuffer(buffer, bufSize);
+                    int count = 0;
+                    if (sensorAvailable)
+                    {
+                        count = Sensor.ReadBuffer(buffer, bufSize);
+                    }
+
                     if (count > 0)
                     {
                         for (int i = 0; i < count; i++)
@@ -591,7 +607,7 @@ namespace ConfocalMeter
 
                     if (scanSw.ElapsedMilliseconds > doneTimeoutMs)
                     {
-                        throw new TimeoutException("扫描超时：未在预期时间内收到 DONE。\n请检查控制器程序或 IN6 配置。");
+                        throw new TimeoutException("扫描超时：未在预期时间内收到 DONE。\n请检查控制器程序或 IN11 配置。");
                     }
 
                     if (scanSw.ElapsedMilliseconds >= nextUiUpdateMs)
@@ -606,8 +622,11 @@ namespace ConfocalMeter
                     }
                 }
 
-                Sensor.SetDataTransfer(false);
-                dataTransferOn = false;
+                if (sensorAvailable)
+                {
+                    Sensor.SetDataTransfer(false);
+                    dataTransferOn = false;
+                }
 
                 if (syncSeen && scanDone)
                 {
@@ -648,25 +667,28 @@ namespace ConfocalMeter
                 {
                     Sensor.SetDataTransfer(false);
                 }
-                Sensor.ForceStopMeasurement();
+                if (sensorAvailable)
+                {
+                    Sensor.ForceStopMeasurement();
+                }
 
                 if (triggerAsserted)
                 {
-                    McuSerialManager.Instance.SetInputBit(McuInputScanReqBit, false); // IN6=断
+                    McuSerialManager.Instance.SetInputBit(McuInputScanReqBit, false); // IN11=断
                 }
             }
 
             AppendScanTimingLog(t0In6OnMs, t1BusyOnMs, t2SyncOnMs, t3DoneOnMs, t4BusyOffMs, errorMessage, warningMessage);
 
             this.BeginInvoke((MethodInvoker)delegate {
-                FinishScan(scanLengthMm, speedMmMin, errorMessage, warningMessage);
+                FinishScan(scanLengthMm, speedMmMin, errorMessage, warningMessage, sensorAvailable);
             });
         }
 
         // ==========================================
         // 4. 数据处理与结果显示 (核心集成点)
         // ==========================================
-        private void FinishScan(double scanLengthMm, double speedMmMin, string errorMessage, string warningMessage)
+        private void FinishScan(double scanLengthMm, double speedMmMin, string errorMessage, string warningMessage, bool sensorAvailable)
         {
             _isScanning = false;
             btnStartScan.Enabled = true; btnStartScan.Text = "开始扫描"; btnStartScan.BackColor = Color.LightGreen;
@@ -689,6 +711,13 @@ namespace ConfocalMeter
             lock (_rawDataLock)
             {
                 snapshot = _rawProfileData.ToArray();
+            }
+
+            if (!sensorAvailable)
+            {
+                lblScanStatus.Text = "联调完成（无传感器）";
+                AppendLog("[联调模式] 握手时序执行完成，已跳过粗糙度计算。");
+                return;
             }
 
             if (snapshot.Length < 100)
@@ -885,6 +914,8 @@ namespace ConfocalMeter
         // --- 辅助逻辑 (保持不变) ---
         private void TimerStatus_Tick(object sender, EventArgs e)
         {
+            UpdateMcuStatusUiAndLog();
+
             if (_isScanning) return;
             bool isAcq = Sensor.IsDeviceAcquiring();
             if (isAcq) { lblDataStatus.Text = "采集中"; lblDataStatus.BackColor = Color.LimeGreen; }
@@ -944,7 +975,7 @@ namespace ConfocalMeter
 
             AppendLog(
                 $"[时序汇总][{state}] " +
-                $"t0(IN6=通)={FormatTimestampMs(t0In6OnMs)} " +
+                $"t0(IN11=通)={FormatTimestampMs(t0In6OnMs)} " +
                 $"t1(BUSY=1)={FormatTimestampMs(t1BusyOnMs)} " +
                 $"t2(SYNC=1)={FormatTimestampMs(t2SyncOnMs)} " +
                 $"t3(DONE=1)={FormatTimestampMs(t3DoneOnMs)} " +
@@ -1029,6 +1060,7 @@ namespace ConfocalMeter
                 btnMcuOpenClose.BackColor = Color.LightGray;
                 lblMcuStatus.Text = "未连接";
                 lblMcuStatus.ForeColor = Color.Gray;
+                _lastMcuCommHealthy = null;
                 AppendLog("MCU串口已关闭");
             }
             else
@@ -1041,14 +1073,51 @@ namespace ConfocalMeter
                 {
                     btnMcuOpenClose.Text = "关闭串口";
                     btnMcuOpenClose.BackColor = Color.LightGreen;
-                    lblMcuStatus.Text = "已连接";
-                    lblMcuStatus.ForeColor = Color.Green;
+                    lblMcuStatus.Text = "已打开(待通信)";
+                    lblMcuStatus.ForeColor = Color.Goldenrod;
+                    _lastMcuCommHealthy = null;
                     AppendLog($"MCU串口已打开: {portName}");
                 }
                 else
                 {
                     MessageBox.Show($"无法打开串口 {portName}，请检查端口是否被占用！", "错误", MessageBoxButtons.OK, MessageBoxIcon.Error);
                 }
+            }
+        }
+
+        private void UpdateMcuStatusUiAndLog()
+        {
+            if (!McuSerialManager.Instance.IsOpen)
+            {
+                lblMcuStatus.Text = "未连接";
+                lblMcuStatus.ForeColor = Color.Gray;
+                _lastMcuCommHealthy = null;
+                return;
+            }
+
+            bool healthy = McuSerialManager.Instance.IsConnected;
+            if (healthy)
+            {
+                lblMcuStatus.Text = "通信正常";
+                lblMcuStatus.ForeColor = Color.Green;
+            }
+            else
+            {
+                lblMcuStatus.Text = "通信超时";
+                lblMcuStatus.ForeColor = Color.Red;
+            }
+
+            if (!_lastMcuCommHealthy.HasValue || _lastMcuCommHealthy.Value != healthy)
+            {
+                if (healthy)
+                {
+                    AppendLog($"MCU通信恢复: {McuSerialManager.Instance.PortName}");
+                }
+                else
+                {
+                    AppendLog($"[警告] MCU通信超时: {McuSerialManager.Instance.PortName}");
+                }
+                _lastMcuCommHealthy = healthy;
             }
         }
     }
